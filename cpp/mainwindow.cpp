@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "backends.h"
 #include "mountidentity.h"
+#include "plainmessagebox.h"
 #include "settingsdialog.h"
 #include <QCheckBox>
 #include <QFile>
@@ -8,7 +9,6 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
-#include <QMessageBox>
 #include <QPixmap>
 #include <QPushButton>
 #include <QTableWidget>
@@ -77,7 +77,7 @@ MainWindow::MainWindow(AppConfig c, ConfigStore s)
   connect(&m_helper, &HelperClient::finished, this,
           [this](const QString &) { refresh(); });
   connect(&m_helper, &HelperClient::failed, this, [this](const QString &e) {
-    QMessageBox::warning(this, "Operation failed", e);
+    PlainMessageBox::warning(this, "Operation failed", e);
   });
   refresh();
   auto *timer = new QTimer(this);
@@ -147,7 +147,7 @@ void MainWindow::settings() {
     try {
       m_store.save(m_config);
     } catch (const std::exception &e) {
-      QMessageBox::critical(this, "Save failed", e.what());
+      PlainMessageBox::critical(this, "Save failed", e.what());
     }
     refresh();
   }
@@ -160,7 +160,7 @@ void MainWindow::control(const QString &a, bool all) {
       ids << c->property("shareId").toString();
   }
   if (ids.isEmpty()) {
-    QMessageBox::information(this, "No shares", "Select at least one share.");
+    PlainMessageBox::information(this, "No shares", "Select at least one share.");
     return;
   }
   m_helper.control(a, ids);

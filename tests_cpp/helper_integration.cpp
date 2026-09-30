@@ -68,6 +68,60 @@ private slots:
     QVERIFY_EXCEPTION_THROWN(control(), std::runtime_error);
     QVERIFY(testCommands.isEmpty());
   }
+  void rejectsUnrelatedUnitWithoutChangingIt() {
+    QDir().mkpath(systemdDir);
+    const auto path = systemdDir + "/" + unit();
+    QFile existing(path);
+    QVERIFY(existing.open(QIODevice::WriteOnly));
+    existing.write("[Mount]\nWhat=//old-server/Storage\n");
+    existing.close();
+    try {
+      requestApply();
+      QFAIL("Expected an unrelated unit conflict");
+    } catch (const std::runtime_error &error) {
+      QVERIFY(QString::fromUtf8(error.what()).contains("different local path"));
+    }
+    QCOMPARE(read(path), QByteArray("[Mount]\nWhat=//old-server/Storage\n"));
+    QVERIFY(loadManaged().isEmpty());
+    QVERIFY(testCommands.isEmpty());
+  }
+  void migratesUnmountedOmamounterUnit() {
+    QDir().mkpath(systemdDir);
+    const auto path = systemdDir + "/" + unit();
+    QFile legacy(path);
+    QVERIFY(legacy.open(QIODevice::WriteOnly));
+    legacy.write(QString("[Unit]\nDescription=omamounter SMB share Storage\n"
+                         "Wants=network-online.target\nAfter=network-online.target\n\n"
+                         "[Mount]\nWhat=//old-server/Storage\nWhere=%1\n"
+                         "Type=cifs\nOptions=credentials=/etc/omamounter/"
+                         "credentials/legacy.cred\n\n"
+                         "[Install]\nWantedBy=multi-user.target\n")
+                     .arg(config.shares[0].localPath).toUtf8());
+    legacy.close();
+    requestApply();
+    QVERIFY(read(path).contains("Description=Tether NFS share"));
+    QCOMPARE(loadManaged().size(), 1);
+  }
+  void keepsMountedOmamounterUnit() {
+    QDir().mkpath(systemdDir);
+    const auto path = systemdDir + "/" + unit();
+    QFile legacy(path);
+    QVERIFY(legacy.open(QIODevice::WriteOnly));
+    legacy.write(QString("[Unit]\nDescription=omamounter SMB share Storage\n"
+                         "Wants=network-online.target\nAfter=network-online.target\n"
+                         "[Mount]\nWhat=//old-server/Storage\nWhere=%1\n"
+                         "Type=cifs\nOptions=credentials=/etc/omamounter/"
+                         "credentials/legacy.cred\n"
+                         "[Install]\nWantedBy=multi-user.target\n")
+                     .arg(config.shares[0].localPath).toUtf8());
+    legacy.close();
+    const auto before = read(path);
+    testMountinfo = ("31 24 0:30 / " + config.shares[0].localPath +
+                     " rw - cifs //old-server/Storage rw\n").toUtf8();
+    QVERIFY_EXCEPTION_THROWN(requestApply(), std::runtime_error);
+    QCOMPARE(read(path), before);
+    QVERIFY(testCommands.isEmpty());
+  }
   void credentialsPrivateAndNotInUnits() {
     config.servers[0].protocol = Protocol::Smb;
     config.servers[0].smbUsername = "tester"; config.shares[0].remotePath = "Media";

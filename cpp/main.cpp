@@ -1,9 +1,9 @@
 #include "config.h"
 #include "mainwindow.h"
+#include "plainmessagebox.h"
 #include "theme.h"
 #include <QApplication>
 #include <QIcon>
-#include <QMessageBox>
 
 int main(int argc, char **argv) {
   QApplication app(argc, argv);
@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
     window.show();
     return app.exec();
   } catch (const std::exception &e) {
-    QMessageBox::critical(nullptr, "Tether", e.what());
+    PlainMessageBox::critical(nullptr, "Tether", e.what());
     return 1;
   }
 }

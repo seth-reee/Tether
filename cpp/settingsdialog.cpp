@@ -1,5 +1,6 @@
 #include "settingsdialog.h"
 #include "backends.h"
+#include "plainmessagebox.h"
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
@@ -16,7 +17,6 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
-#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPixmap>
 #include <QProcess>
@@ -189,11 +189,11 @@ SettingsDialog::SettingsDialog(const AppConfig &c, QWidget *p)
       accept();
       return;
     }
-    QMessageBox::information(this, "Applied", m);
+    PlainMessageBox::information(this, "Applied", m);
   });
   connect(&m_helper, &HelperClient::failed, this, [this](const QString &m) {
     m_acceptAfterApply = false;
-    QMessageBox::warning(this, "Apply failed", m);
+    PlainMessageBox::warning(this, "Apply failed", m);
   });
   rebuildServers();
   rebuildShares();
@@ -261,7 +261,7 @@ bool SettingsDialog::applyServer() {
     m_config.servers[row] = s;
     return true;
   } catch (const std::exception &e) {
-    QMessageBox::warning(this, "Invalid server", e.what());
+    PlainMessageBox::warning(this, "Invalid server", e.what());
     return false;
   }
 }
@@ -409,7 +409,7 @@ void SettingsDialog::saveAndAccept() {
         try {
           ConfigStore().save(m_config);
         } catch (const std::exception &error) {
-          QMessageBox::warning(this, "Save failed", error.what());
+          PlainMessageBox::warning(this, "Save failed", error.what());
           return;
         }
         m_acceptAfterApply = true;
@@ -441,7 +441,7 @@ void SettingsDialog::withPasswords(std::function<void()> next, bool persist) {
             m_secretBusy = false;
             setEnabled(true);
             if (!result.second.isEmpty()) {
-              QMessageBox::warning(this, "Password storage", result.second);
+              PlainMessageBox::warning(this, "Password storage", result.second);
               return;
             }
             m_passwords = result.first;
@@ -491,7 +491,7 @@ bool SettingsDialog::collectSettings() {
     m_config = next;
     return true;
   } catch (const std::exception &e) {
-    QMessageBox::warning(this, "Invalid settings", e.what());
+    PlainMessageBox::warning(this, "Invalid settings", e.what());
     return false;
   }
 }
@@ -508,7 +508,7 @@ void SettingsDialog::testConnection() {
         QString address =
             info.addresses().isEmpty() ? server.fallbackIp : server.hostname;
         if (address.isEmpty()) {
-          QMessageBox::warning(
+          PlainMessageBox::warning(
               this, "Connection failed",
               "Hostname did not resolve and no fallback IP is configured.");
           return;
@@ -520,7 +520,7 @@ void SettingsDialog::testConnection() {
                   if (*done)
                     return;
                   *done = true;
-                  QMessageBox::information(this, "Connection",
+                  PlainMessageBox::information(this, "Connection",
                                            "Connected to " + address + ".");
                   socket->deleteLater();
                 });
@@ -529,7 +529,7 @@ void SettingsDialog::testConnection() {
                   if (*done)
                     return;
                   *done = true;
-                  QMessageBox::warning(this, "Connection failed",
+                  PlainMessageBox::warning(this, "Connection failed",
                                        socket->errorString());
                   socket->deleteLater();
                 });
@@ -537,7 +537,7 @@ void SettingsDialog::testConnection() {
           if (!*done) {
             *done = true;
             socket->abort();
-            QMessageBox::warning(this, "Connection failed",
+            PlainMessageBox::warning(this, "Connection failed",
                                  "Connection timed out.");
             socket->deleteLater();
           }
@@ -559,7 +559,7 @@ void SettingsDialog::discover() {
         QString address =
             info.addresses().isEmpty() ? server.fallbackIp : server.hostname;
         if (address.isEmpty()) {
-          QMessageBox::warning(
+          PlainMessageBox::warning(
               this, "Discovery failed",
               "Hostname did not resolve and no fallback IP is configured.");
           return;
@@ -583,7 +583,7 @@ void SettingsDialog::runDiscovery(const Server &server,
   else {
     auto password = m_passwords.value(server.id);
     if (password.isEmpty()) {
-      QMessageBox::warning(this, "Discovery failed",
+      PlainMessageBox::warning(this, "Discovery failed",
                            "Save an SMB password first.");
       process->deleteLater();
       return;
@@ -593,7 +593,7 @@ void SettingsDialog::runDiscovery(const Server &server,
     credentials->setPermissions(QFileDevice::ReadOwner |
                                 QFileDevice::WriteOwner);
     if (!credentials->open()) {
-      QMessageBox::warning(this, "Discovery failed",
+      PlainMessageBox::warning(this, "Discovery failed",
                            "Could not create private credentials file.");
       process->deleteLater();
       return;
@@ -611,7 +611,7 @@ void SettingsDialog::runDiscovery(const Server &server,
   connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
           this, [this, process, server](int code, QProcess::ExitStatus) {
             if (code != 0) {
-              QMessageBox::warning(
+              PlainMessageBox::warning(
                   this, "Discovery failed",
                   QString::fromUtf8(process->readAllStandardError()) +
                       "\nYou can still add shares manually.");
@@ -622,7 +622,7 @@ void SettingsDialog::runDiscovery(const Server &server,
                              ? parseNfsExports(process->readAllStandardOutput())
                              : parseSmbShares(process->readAllStandardOutput());
             if (found.isEmpty()) {
-              QMessageBox::information(
+              PlainMessageBox::information(
                   this, "Discovery",
                   "No shares were enumerated. NFSv4 discovery is not always "
                   "available; manual entry remains supported.");
@@ -631,6 +631,8 @@ void SettingsDialog::runDiscovery(const Server &server,
             }
             QDialog dialog(this);
             dialog.setWindowTitle("Select discovered shares");
+            dialog.setObjectName("discoveredSharesDialog");
+            dialog.resize(640, qBound(360, 220 + int(found.size()) * 32, 600));
             auto *layout = new QVBoxLayout(&dialog);
             auto *list = new QListWidget;
             for (const auto &remote : found) {

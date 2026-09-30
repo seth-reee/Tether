@@ -212,19 +212,73 @@ QJsonArray loadManaged() {
       .toArray();
 }
 
-void verifyMount(const QJsonObject &record) {
+bool isLegacyOmamounterUnit(const QString &name, const QString &localPath) {
+  QFileInfo info(systemdDir + "/" + name);
+  if (info.isSymLink() || !info.isFile() || info.size() > 65536)
+    return false;
+  QFile file(info.filePath());
+  if (!file.open(QIODevice::ReadOnly))
+    return false;
+  QString section;
+  QHash<QString, QString> unit, mount, install;
+  for (const auto &raw : QString::fromUtf8(file.readAll()).split('\n')) {
+    const QString line = raw.trimmed();
+    if (line.isEmpty() || line.startsWith('#'))
+      continue;
+    if (line.startsWith('[') && line.endsWith(']')) {
+      section = line.mid(1, line.size() - 2);
+      if (section != "Unit" && section != "Mount" && section != "Install")
+        return false;
+      continue;
+    }
+    const int equals = line.indexOf('=');
+    if (equals <= 0)
+      return false;
+    const QString key = line.left(equals), value = line.mid(equals + 1);
+    auto *fields = section == "Unit" ? &unit : section == "Mount" ? &mount
+                             : section == "Install" ? &install : nullptr;
+    const bool knownKey =
+        (section == "Unit" &&
+         QSet<QString>{"Description", "Wants", "After"}.contains(key)) ||
+        (section == "Mount" &&
+         QSet<QString>{"What", "Where", "Type", "Options"}.contains(key)) ||
+        (section == "Install" && key == "WantedBy");
+    if (!fields || !knownKey || fields->contains(key))
+      return false;
+    fields->insert(key, value);
+  }
+  const auto description = unit.value("Description");
+  const auto type = mount.value("Type");
+  const bool smb = description.startsWith("omamounter SMB share ") &&
+                   type == "cifs" &&
+                   mount.value("What").startsWith("//") &&
+                   mount.value("Options").contains(
+                       "credentials=/etc/omamounter/credentials/");
+  const bool nfs = description.startsWith("omamounter NFS share ") &&
+                   type == "nfs" && mount.value("What").contains(':');
+  return (smb || nfs) && mount.value("Where") == localPath &&
+         name == escapePath(localPath) + ".mount" &&
+         !unit.value("Wants").isEmpty() && !unit.value("After").isEmpty() &&
+         !install.value("WantedBy").isEmpty();
+}
+
+QByteArray currentMountInfo() {
 #ifdef TETHER_HELPER_TEST
-  if (!mountIdentityMatches(testMountinfo, record["local_path"].toString(),
-                            record["source"].toString(), record["type"].toString(),
-                            !record["automount_unit"].toString().isEmpty()))
+  return testMountinfo;
 #else
   QFile mounts("/proc/self/mountinfo");
-  if (!mounts.open(QIODevice::ReadOnly) ||
-      !mountIdentityMatches(mounts.readAll(), record["local_path"].toString(),
+  if (!mounts.open(QIODevice::ReadOnly))
+    fail("Could not read mount state");
+  return mounts.readAll();
+#endif
+}
+
+void verifyMount(const QJsonObject &record) {
+  if (!mountIdentityMatches(currentMountInfo(),
+                            record["local_path"].toString(),
                             record["source"].toString(),
                             record["type"].toString(),
                             !record["automount_unit"].toString().isEmpty()))
-#endif
     fail("Mount identity could not be verified; refusing to change this share. "
          "Reapply legacy configurations first.");
 }
@@ -304,12 +358,23 @@ void apply() {
     ownedUnits.insert(v.toObject()["mount_unit"].toString());
     ownedUnits.insert(v.toObject()["automount_unit"].toString());
   }
+  for (const auto &g : generated)
+    if (!ownedUnits.contains(g.mountUnit) &&
+        isLegacyOmamounterUnit(g.mountUnit, g.localPath)) {
+      if (mountStatus(currentMountInfo(), g.localPath, {g.source}, g.type) !=
+          "Unmounted")
+        fail("Unmount the old OmaMounter share at " + g.localPath +
+             " before applying its Tether replacement.");
+      ownedUnits.insert(g.mountUnit);
+    }
   for (const auto &name : newUnits) {
     if (!ownedUnits.contains(name) &&
         (QFileInfo::exists(systemdDir + "/" + name) ||
          QFileInfo::exists("/usr/lib/systemd/system/" + name) ||
          QFileInfo::exists("/run/systemd/system/" + name)))
-      fail("Refusing to replace an unrelated systemd unit: " + name);
+      fail("Another application owns systemd unit " + name +
+           ". Choose a different local path for this share in Tether's Shares "
+           "tab, or retire the existing unit before applying again.");
   }
   FileTransaction transaction;
   transaction.capture(manifestPath);

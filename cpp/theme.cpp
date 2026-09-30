@@ -52,12 +52,15 @@ void ThemeManager::apply() {
   p.setColor(QPalette::PlaceholderText, placeholder);
   p.setColor(QPalette::ToolTipBase, panel);
   p.setColor(QPalette::ToolTipText, fg);
+  p.setColor(QPalette::Link, accent);
+  p.setColor(QPalette::LinkVisited, accent);
   p.setColor(QPalette::Disabled, QPalette::WindowText, QColor(c["dark_foreground"]));
   p.setColor(QPalette::Disabled, QPalette::Text, QColor(c["dark_foreground"]));
   p.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(c["dark_foreground"]));
   m_app->setPalette(p);
   m_app->setStyleSheet(
       QString("QWidget { font-size: 13px; } "
+              "QDialogButtonBox { dialogbuttonbox-buttons-have-icons: 0; } "
               "QPushButton, QLineEdit, QComboBox { padding: 7px 10px; border: 1px solid %1; border-radius: 6px; } "
               "QPushButton:hover { border-color: %2; } QPushButton:disabled { color: %3; } "
               "QTableWidget { border: 1px solid %1; border-radius: 6px; gridline-color: %1; } "

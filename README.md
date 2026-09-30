@@ -33,7 +33,10 @@ The package recipe supports Omarchy on x86_64 and ARM64, using Arch Linux and Ar
 **ARM64 status:** The ARM64 package built and passed automated tests under QEMU, but remains untested on a real ARM64 Omarchy desktop. Network mounting and authorization need a real-system check.
 
 The Tether package replaces omamounter. Tether stores its configuration in a
-new location, so add your servers and shares again after upgrading.
+new location, so add your servers and shares again after upgrading. When you
+apply a share at the same destination as an old OmaMounter share, Tether can
+replace the legacy mount unit if that destination is unmounted. Mount units
+from other applications are left untouched.
 
 For manual installation, extract the binary tarball and follow its
 `INSTALL.txt`. It includes the application and required authorization helpers;
