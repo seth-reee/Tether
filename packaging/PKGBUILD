@@ -1,5 +1,5 @@
 pkgname=tether
-pkgver=0.3.3
+pkgver=0.3.4
 pkgrel=1
 pkgdesc='Qt NFS and SMB share manager for Omarchy'
 arch=('x86_64' 'aarch64')
@@ -11,7 +11,7 @@ depends=('qt6-base' 'libsecret' 'polkit' 'nfs-utils' 'cifs-utils' 'smbclient')
 makedepends=('cmake' 'ninja' 'gcc')
 options=('!debug')
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
-sha256sums=('ad2fad0e8bfc442c8dda2b60ed5f75a43d67e1a2bb6f67135defed019ce52346')
+sha256sums=('26d9750a207c5c1e6ea42f0873fd2a89411d05ef010e7c55df039ea8993eda94')
 
 build() {
   cmake -S "$srcdir/Tether-$pkgver" -B build -G Ninja \
