@@ -1,11 +1,11 @@
-Tether manual binary installation (Omarchy x86_64 or ARM64; Arch Linux or Arch Linux ARM)
+Tether manual installation from a local build (Omarchy x86_64 or ARM64; Arch Linux or Arch Linux ARM)
 
-Prefer the .pkg.tar.zst package: sudo pacman -U tether-*.pkg.tar.zst
+Prefer the .pkg.tar.zst package from Releases: sudo pacman -U tether-*.pkg.tar.zst
 
-For the binary tarball, install runtime dependencies:
+For manual installation from a staged build (cmake --install build --prefix ./stage/usr), install runtime dependencies:
   sudo pacman -S qt6-base libsecret polkit nfs-utils cifs-utils smbclient
 
-From the extracted directory, install the application and authorization helpers:
+From the staged directory, install the application and authorization helpers:
   sudo install -Dm755 usr/bin/tether /usr/bin/tether
   sudo install -Dm755 usr/lib/tether/tether-apply-helper /usr/lib/tether/tether-apply-helper
   sudo install -Dm755 usr/lib/tether/tether-control-helper /usr/lib/tether/tether-control-helper

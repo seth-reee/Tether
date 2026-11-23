@@ -2,6 +2,7 @@
 
 #include <QJsonObject>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 enum class Protocol { Nfs, Smb };
@@ -29,6 +30,14 @@ struct AppConfig {
 
 QString protocolName(Protocol value);
 QString automountName(AutomountMode value);
+QStringList allowedNfsVersions();
+QStringList allowedSmbVersions();
+QString smbMountVersion(const QString &version);
+QString smbClientProtocol(const QString &version);
+QString formatNfsSource(const QString &address, const QString &remotePath);
+QString escapeSystemdSpecifier(QString value);
+QString escapeSystemdPath(const QString &path);
+bool isValidMountOptions(const QString &value);
 QJsonObject toJson(const AppConfig &config);
 AppConfig fromJson(const QJsonObject &object);
 AppConfig defaultConfig();

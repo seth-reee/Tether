@@ -21,4 +21,6 @@ private:
   QLabel *m_summary;
   QWidget *m_welcome;
   HelperClient m_helper;
+  QStringList m_rowKeys;
+  Q_INVOKABLE QStringList collectControlIds(bool all) const;
 };

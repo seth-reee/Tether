@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <stdexcept>
@@ -17,6 +18,87 @@ QString automountName(AutomountMode value) {
   if (value == AutomountMode::Access)
     return "access";
   return "disabled";
+}
+QStringList allowedNfsVersions() {
+  return {"3", "4", "4.0", "4.1", "4.2"};
+}
+QStringList allowedSmbVersions() {
+  return {"default", "2.0", "2.1", "3", "3.0", "3.02", "3.1.1", "SMB2", "SMB3"};
+}
+QString smbMountVersion(const QString &version) {
+  if (version.isEmpty() || version == "default")
+    return {};
+  if (version == "SMB2")
+    return "2.1";
+  if (version == "SMB3")
+    return "3";
+  return version;
+}
+QString smbClientProtocol(const QString &version) {
+  if (version.isEmpty() || version == "default")
+    return {};
+  if (version == "2.0")
+    return "SMB2_02";
+  if (version == "2.1")
+    return "SMB2_10";
+  if (version == "SMB2")
+    return "SMB2";
+  if (version == "3" || version == "SMB3")
+    return "SMB3";
+  if (version == "3.0")
+    return "SMB3_00";
+  if (version == "3.02")
+    return "SMB3_02";
+  if (version == "3.1.1")
+    return "SMB3_11";
+  return version;
+}
+QString formatNfsSource(const QString &address, const QString &remotePath) {
+  const bool ipv6Literal =
+      address.contains(':') && !address.startsWith('[');
+  return (ipv6Literal ? "[" + address + "]" : address) + ":" + remotePath;
+}
+QString escapeSystemdSpecifier(QString value) {
+  return value.replace('%', "%%");
+}
+QString escapeSystemdPath(const QString &path) {
+  if (!path.startsWith('/') || path.contains(QChar('\0')) ||
+      path.contains('\n') || path.contains('\r') ||
+      path.split('/').contains(".."))
+    throw std::invalid_argument("Invalid absolute path");
+  const QByteArray raw = QDir::cleanPath(path).mid(1).toUtf8();
+  if (raw.isEmpty())
+    return "-";
+  QByteArray out;
+  for (int i = 0; i < raw.size(); ++i) {
+    const uchar b = static_cast<uchar>(raw[i]);
+    if (i == 0 && b == '.')
+      out += "\\x2e";
+    else if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+             (b >= '0' && b <= '9') || b == '_' || b == '.')
+      out += char(b);
+    else if (b == '/')
+      out += '-';
+    else
+      out += QString("\\x%1").arg(b, 2, 16, QChar('0')).toLatin1();
+  }
+  return QString::fromLatin1(out);
+}
+bool isValidMountOptions(const QString &value) {
+  if (value.size() > 1024 ||
+      value.contains(QRegularExpression("[\\s\\x00]")))
+    return false;
+  if (value.isEmpty())
+    return true;
+  if (value.startsWith(',') || value.endsWith(',') || value.contains(",,"))
+    return false;
+  for (const auto &token : value.split(',')) {
+    const QString key = token.section('=', 0, 0).toLower();
+    if (key == "password" || key == "pass" || key == "credentials" ||
+        key == "cred")
+      return false;
+  }
+  return true;
 }
 static Protocol protocolFrom(const QString &value) {
   return value.compare("smb", Qt::CaseInsensitive) == 0 ? Protocol::Smb

@@ -22,6 +22,7 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QTextBrowser>
+#include <QRegularExpression>
 #include <QSignalBlocker>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -78,8 +79,9 @@ void showTetherAbout(QWidget *parent) {
   popup->open();
 }
 
-SettingsDialog::SettingsDialog(const AppConfig &c, QWidget *p)
-    : QDialog(p), m_config(c), m_helper(this) {
+SettingsDialog::SettingsDialog(const AppConfig &c, QWidget *p,
+                               ConfigStore store)
+    : QDialog(p), m_config(c), m_store(std::move(store)), m_helper(this) {
   setWindowTitle("Tether Settings");
   resize(900, 600);
   auto *outer = new QVBoxLayout(this);
@@ -107,10 +109,12 @@ SettingsDialog::SettingsDialog(const AppConfig &c, QWidget *p)
   m_protocol = new QComboBox;
   m_protocol->setObjectName("serverProtocol");
   m_protocol->addItems({"NFS", "SMB"});
-  m_nfs = new QLineEdit;
+  m_nfs = new QComboBox;
+  m_nfs->addItems(allowedNfsVersions());
   m_user = new QLineEdit;
   m_domain = new QLineEdit;
-  m_smbver = new QLineEdit;
+  m_smbver = new QComboBox;
+  m_smbver->addItems(allowedSmbVersions());
   m_options = new QLineEdit;
   m_password = new QLineEdit;
   m_password->setEchoMode(QLineEdit::Password);
@@ -134,11 +138,16 @@ SettingsDialog::SettingsDialog(const AppConfig &c, QWidget *p)
   auto updateProtocolFields = [this, f] {
     const bool smb = m_protocol->currentText() == "SMB";
     f->setRowVisible(m_nfs, !smb);
-    for (auto *field : {m_user, m_domain, m_smbver, m_password})
+    for (QWidget *field : QList<QWidget *>{m_user, m_domain, m_smbver, m_password})
       f->setRowVisible(field, smb);
   };
   connect(m_protocol, &QComboBox::currentIndexChanged, this,
-          updateProtocolFields);
+          [this, updateProtocolFields] {
+            updateProtocolFields();
+            syncServerForm();
+          });
+  connect(m_name, &QLineEdit::textEdited, this,
+          [this] { syncServerForm(); });
   updateProtocolFields();
   auto *sb = new QHBoxLayout;
   for (auto pair : QList<QPair<QString, void (SettingsDialog::*)()>>{
@@ -186,13 +195,31 @@ SettingsDialog::SettingsDialog(const AppConfig &c, QWidget *p)
   connect(&m_helper, &HelperClient::finished, this, [this](const QString &m) {
     if (m_acceptAfterApply) {
       m_acceptAfterApply = false;
+      try {
+        m_store.save(m_config);
+        m_savedToDisk = true;
+      } catch (const std::exception &error) {
+        PlainMessageBox::warning(this, "Save failed", error.what());
+        return;
+      }
       accept();
       return;
     }
     PlainMessageBox::information(this, "Applied", m);
   });
   connect(&m_helper, &HelperClient::failed, this, [this](const QString &m) {
+    const bool wasSaveApply = m_acceptAfterApply;
     m_acceptAfterApply = false;
+    // If units were installed and only activation failed (e.g. offline server),
+    // persist the configuration so mounting can be retried.
+    if (wasSaveApply && m.contains("Configuration installed")) {
+      try {
+        m_store.save(m_config);
+        m_savedToDisk = true;
+      } catch (const std::exception &error) {
+        PlainMessageBox::warning(this, "Save failed", error.what());
+      }
+    }
     PlainMessageBox::warning(this, "Apply failed", m);
   });
   rebuildServers();
@@ -210,54 +237,87 @@ void SettingsDialog::rebuildServers() {
     m_servers->setCurrentRow(qBound(0, row, m_config.servers.size() - 1));
   loadServer(m_servers->currentRow());
 }
-void SettingsDialog::loadServer(int row) {
+void SettingsDialog::syncServerForm() {
+  int row = m_loadedServer;
   if (row < 0 || row >= m_config.servers.size())
     return;
-  if (m_loadedServer >= 0 && m_loadedServer != row && !applyServer()) {
-    QSignalBlocker blocker(m_servers);
-    m_servers->setCurrentRow(m_loadedServer);
+  auto &s = m_config.servers[row];
+  s.name = m_name->text().trimmed();
+  s.hostname = m_host->text().trimmed();
+  s.fallbackIp = m_fallback->text().trimmed();
+  s.protocol =
+      m_protocol->currentText() == "SMB" ? Protocol::Smb : Protocol::Nfs;
+  s.nfsVersion = m_nfs->currentText().trimmed();
+  s.smbUsername = m_user->text().trimmed();
+  s.smbDomain = m_domain->text().trimmed();
+  s.smbVersion = m_smbver->currentText().trimmed();
+  s.mountOptions = m_options->text().trimmed();
+  if (s.protocol == Protocol::Smb && m_password->isModified()) {
+    m_passwords[s.id] = m_password->text();
+    m_passwordEdits.insert(s.id);
+    m_password->setModified(false);
+  }
+  if (auto *item = m_servers->item(row))
+    item->setText(s.name + " (" + protocolName(s.protocol).toUpper() + ")");
+  for (int r = 0; r < m_shares->rowCount() && r < m_config.shares.size(); ++r)
+    if (m_config.shares[r].serverId == s.id && m_shares->item(r, 0))
+      m_shares->item(r, 0)->setText(s.name);
+}
+void SettingsDialog::loadServer(int row) {
+  syncServerForm();
+  if (row < 0 || row >= m_config.servers.size()) {
+    m_loadedServer = -1;
+    m_name->clear();
+    m_host->clear();
+    m_fallback->clear();
+    m_user->clear();
+    m_domain->clear();
+    m_options->clear();
+    m_password->clear();
+    m_password->setModified(false);
     return;
   }
   m_loadedServer = row;
   const auto &s = m_config.servers[row];
+  QSignalBlocker blockProtocol(m_protocol);
   m_name->setText(s.name);
   m_host->setText(s.hostname);
   m_fallback->setText(s.fallbackIp);
   m_protocol->setCurrentText(protocolName(s.protocol).toUpper());
-  m_nfs->setText(s.nfsVersion);
+  const int nfsIndex = m_nfs->findText(s.nfsVersion);
+  m_nfs->setCurrentIndex(nfsIndex >= 0 ? nfsIndex : m_nfs->findText("4"));
   m_user->setText(s.smbUsername);
   m_domain->setText(s.smbDomain);
-  m_smbver->setText(s.smbVersion);
+  const int smbIndex = m_smbver->findText(s.smbVersion);
+  m_smbver->setCurrentIndex(smbIndex >= 0 ? smbIndex : 0);
   m_options->setText(s.mountOptions);
   m_password->clear();
   m_password->setPlaceholderText("Leave blank to keep saved password");
   if (m_passwords.contains(s.id))
     m_password->setText(m_passwords.value(s.id));
   m_password->setModified(false);
+  if (auto *form = qobject_cast<QFormLayout *>(m_nfs->parentWidget()->layout())) {
+    const bool smb = s.protocol == Protocol::Smb;
+    form->setRowVisible(m_nfs, !smb);
+    for (QWidget *field : QList<QWidget *>{m_user, m_domain, m_smbver, m_password})
+      form->setRowVisible(field, smb);
+  }
 }
 bool SettingsDialog::applyServer() {
+  syncServerForm();
   int row = m_loadedServer;
-  if (row < 0)
+  if (row < 0 || row >= m_config.servers.size())
     return true;
   try {
     auto s = m_config.servers[row];
-    s.name = m_name->text().trimmed();
-    s.hostname = validateAddress(m_host->text());
-    s.fallbackIp = m_fallback->text().trimmed();
+    s.hostname = validateAddress(s.hostname);
     if (!s.fallbackIp.isEmpty())
-      validateAddress(s.fallbackIp);
-    s.protocol =
-        m_protocol->currentText() == "SMB" ? Protocol::Smb : Protocol::Nfs;
-    s.nfsVersion = m_nfs->text().trimmed();
-    s.smbUsername = m_user->text().trimmed();
-    s.smbDomain = m_domain->text().trimmed();
-    s.smbVersion = m_smbver->text().trimmed();
-    s.mountOptions = validateMountOptions(m_options->text());
-    if (s.protocol == Protocol::Smb && m_password->isModified()) {
-      m_passwords[s.id] = m_password->text();
-      m_passwordEdits.insert(s.id);
-      m_password->setModified(false);
-    }
+      s.fallbackIp = validateAddress(s.fallbackIp);
+    if (!allowedNfsVersions().contains(s.nfsVersion))
+      throw std::invalid_argument("Unsupported NFS version");
+    if (!allowedSmbVersions().contains(s.smbVersion))
+      throw std::invalid_argument("Unsupported SMB version");
+    s.mountOptions = validateMountOptions(s.mountOptions);
     m_config.servers[row] = s;
     return true;
   } catch (const std::exception &e) {
@@ -266,10 +326,12 @@ bool SettingsDialog::applyServer() {
   }
 }
 void SettingsDialog::addServer() {
-  if (!collectSettings())
-    return;
-  m_config.servers.append({QUuid::createUuid().toString(QUuid::WithoutBraces),
-                           "New server", "", "", Protocol::Nfs});
+  syncServerForm();
+  Server server;
+  server.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+  server.name = "New server";
+  server.protocol = Protocol::Nfs;
+  m_config.servers.append(server);
   rebuildServers();
   m_servers->setCurrentRow(m_config.servers.size() - 1);
   m_host->setPlaceholderText("Hostname or IP address");
@@ -280,14 +342,17 @@ void SettingsDialog::beginAddServer() {
   addServer();
 }
 void SettingsDialog::removeServer() {
-  if (!collectSettings())
-    return;
   int row = m_servers->currentRow();
-  if (row < 0)
+  if (row < 0 || row >= m_config.servers.size())
     return;
-  auto id = m_config.servers[row].id;
+  // Discard selected server before validating; empty or invalid servers must
+  // also be removable.
+  const auto id = m_config.servers[row].id;
+  m_loadedServer = -1;
   m_config.servers.removeAt(row);
   m_config.shares.removeIf([&](const Share &s) { return s.serverId == id; });
+  m_passwords.remove(id);
+  m_passwordEdits.remove(id);
   rebuildServers();
   rebuildShares();
 }
@@ -319,25 +384,59 @@ void SettingsDialog::rebuildShares() {
     m_shares->setCellWidget(r, 5, enabled);
   }
 }
+static QString safeMountLeaf(QString name, const QString &fallback) {
+  name = name.trimmed();
+  name.replace('/', '_');
+  name.replace('\\', '_');
+  if (name.isEmpty() || name == "." || name == "..") {
+    name = fallback.trimmed();
+    name.replace('/', '_');
+    name.replace('\\', '_');
+  }
+  return (name.isEmpty() || name == "." || name == "..") ? "share" : name;
+}
+
 void SettingsDialog::addShare() {
   if (!collectSettings())
     return;
   if (m_config.servers.isEmpty())
     return;
+  int row = qMax(0, m_servers->currentRow());
+  if (m_config.servers.size() > 1) {
+    QStringList choices;
+    for (int i = 0; i < m_config.servers.size(); ++i)
+      choices << QString("%1: %2 (%3)")
+                     .arg(i + 1)
+                     .arg(m_config.servers[i].name,
+                          protocolName(m_config.servers[i].protocol).toUpper());
+    bool picked = false;
+    const auto choice = QInputDialog::getItem(
+        this, "Add share", "Server", choices, row, false, &picked);
+    if (!picked)
+      return;
+    row = choices.indexOf(choice);
+    if (row < 0)
+      return;
+  }
   bool ok = false;
   auto name = QInputDialog::getText(this, "Add share", "Share name",
-                                    QLineEdit::Normal, "", &ok);
+                                    QLineEdit::Normal, "", &ok)
+                  .trimmed();
   if (!ok || name.isEmpty())
     return;
-  int row = qMax(0, m_servers->currentRow());
   auto &s = m_config.servers[row];
   auto remote = QInputDialog::getText(
-      this, "Add share", "Remote path / SMB share", QLineEdit::Normal,
-      s.protocol == Protocol::Nfs ? "/" : name, &ok);
-  if (ok)
+                    this, "Add share", "Remote path / SMB share",
+                    QLineEdit::Normal,
+                    s.protocol == Protocol::Nfs ? "/" : name, &ok)
+                    .trimmed();
+  if (ok) {
+    const QString localPath = QDir::cleanPath(
+        m_root->text().trimmed() + "/" + safeMountLeaf(name, s.name));
     m_config.shares.append({QUuid::createUuid().toString(QUuid::WithoutBraces),
-                            s.id, name, remote, m_root->text() + "/" + name, "",
+                            s.id, name, remote, localPath, "",
                             AutomountMode::Disabled, true});
+  }
   rebuildShares();
 }
 void SettingsDialog::removeShare() {
@@ -403,15 +502,6 @@ void SettingsDialog::saveAndAccept() {
     return;
   withPasswords(
       [this] {
-        // Save the desired state before invoking system integration, so a
-        // failed activation can be retried without losing share IDs and edited
-        // settings.
-        try {
-          ConfigStore().save(m_config);
-        } catch (const std::exception &error) {
-          PlainMessageBox::warning(this, "Save failed", error.what());
-          return;
-        }
         m_acceptAfterApply = true;
         m_helper.apply(m_config, m_passwords);
       },
@@ -454,8 +544,11 @@ void SettingsDialog::withPasswords(std::function<void()> next, bool persist) {
                                         edits = m_passwordEdits,
                                         persist]() mutable -> Result {
     for (const auto &id : ids) {
-      if (!cached.contains(id))
-        cached[id] = lookupPassword(id);
+      if (!cached.contains(id) || cached.value(id).isEmpty()) {
+        const QString found = lookupPassword(id);
+        if (!found.isEmpty())
+          cached[id] = found;
+      }
       if (persist && edits.contains(id) && !storePassword(id, cached.value(id)))
         return {cached, "Secret Service could not store the SMB password. "
                         "Unlock your keyring and try again."};
@@ -464,18 +557,29 @@ void SettingsDialog::withPasswords(std::function<void()> next, bool persist) {
   }));
 }
 bool SettingsDialog::collectSettings() {
-  if (!applyServer())
-    return false;
+  syncServerForm();
   auto next = m_config;
   next.mountRoot = m_root->text().trimmed();
   try {
-    validateAbsolutePath(next.mountRoot);
-    for (int r = 0; r < m_shares->rowCount() && r < m_config.shares.size();
-         ++r) {
+    next.mountRoot = validateAbsolutePath(next.mountRoot);
+    QHash<QString, Server> serversById;
+    for (auto &s : next.servers) {
+      s.hostname = validateAddress(s.hostname);
+      if (!s.fallbackIp.isEmpty())
+        s.fallbackIp = validateAddress(s.fallbackIp);
+      if (!allowedNfsVersions().contains(s.nfsVersion))
+        throw std::invalid_argument("Unsupported NFS version.");
+      if (!allowedSmbVersions().contains(s.smbVersion))
+        throw std::invalid_argument("Unsupported SMB version.");
+      s.mountOptions = validateMountOptions(s.mountOptions);
+      serversById.insert(s.id, s);
+    }
+    QSet<QString> enabledPaths;
+    for (int r = 0; r < m_shares->rowCount() && r < next.shares.size(); ++r) {
       auto &h = next.shares[r];
-      h.name = m_shares->item(r, 1)->text();
-      h.remotePath = m_shares->item(r, 2)->text();
-      h.localPath = validateAbsolutePath(m_shares->item(r, 3)->text());
+      h.name = m_shares->item(r, 1)->text().trimmed();
+      h.remotePath = m_shares->item(r, 2)->text().trimmed();
+      h.localPath = validateAbsolutePath(m_shares->item(r, 3)->text().trimmed());
       auto mode = qobject_cast<QComboBox *>(m_shares->cellWidget(r, 4))
                       ->currentData()
                       .toString();
@@ -487,6 +591,26 @@ bool SettingsDialog::collectSettings() {
                                        : AutomountMode::Disabled;
       h.enabled =
           qobject_cast<QCheckBox *>(m_shares->cellWidget(r, 5))->isChecked();
+      if (h.enabled) {
+        if (!serversById.contains(h.serverId))
+          throw std::invalid_argument("Share references a missing server.");
+        const auto &srv = serversById[h.serverId];
+        if (srv.protocol == Protocol::Nfs) {
+          h.remotePath = validateAbsolutePath(h.remotePath);
+        } else {
+          if (h.remotePath.isEmpty() ||
+              h.remotePath.contains(
+                  QRegularExpression("[\\\\/\\n\\r\\x00]")))
+            throw std::invalid_argument("Invalid SMB share name.");
+          if (srv.smbUsername.isEmpty())
+            throw std::invalid_argument(
+                "SMB username is required for enabled shares.");
+        }
+        if (enabledPaths.contains(h.localPath))
+          throw std::invalid_argument(
+              "Two enabled shares use the same mount destination.");
+        enabledPaths.insert(h.localPath);
+      }
     }
     m_config = next;
     return true;
@@ -570,7 +694,9 @@ void SettingsDialog::discover() {
 
 void SettingsDialog::runDiscovery(const Server &server,
                                   const QString &address) {
-  if (server.protocol == Protocol::Smb && !m_passwords.contains(server.id)) {
+  if (server.protocol == Protocol::Smb &&
+      (!m_passwords.contains(server.id) ||
+       m_passwords.value(server.id).isEmpty())) {
     withPasswords([this, server, address] { runDiscovery(server, address); },
                   false);
     return;
@@ -578,23 +704,26 @@ void SettingsDialog::runDiscovery(const Server &server,
   auto *process = new QProcess(this);
   QStringList arguments;
   QTemporaryFile *credentials = nullptr;
+  const QString program = server.protocol == Protocol::Nfs
+                              ? "/usr/bin/showmount"
+                              : "/usr/bin/smbclient";
   if (server.protocol == Protocol::Nfs)
     arguments = {"--exports", address};
   else {
     auto password = m_passwords.value(server.id);
     if (password.isEmpty()) {
       PlainMessageBox::warning(this, "Discovery failed",
-                           "Save an SMB password first.");
+                               "Save an SMB password first.");
       process->deleteLater();
       return;
     }
     credentials = new QTemporaryFile(
         QDir::tempPath() + "/tether-XXXXXX.cred", process);
-    credentials->setPermissions(QFileDevice::ReadOwner |
-                                QFileDevice::WriteOwner);
-    if (!credentials->open()) {
+    if (!credentials->open() ||
+        !credentials->setPermissions(QFileDevice::ReadOwner |
+                                     QFileDevice::WriteOwner)) {
       PlainMessageBox::warning(this, "Discovery failed",
-                           "Could not create private credentials file.");
+                               "Could not create private credentials file.");
       process->deleteLater();
       return;
     }
@@ -605,11 +734,39 @@ void SettingsDialog::runDiscovery(const Server &server,
             .toUtf8());
     credentials->flush();
     arguments = {"-L", address, "-g", "-A", credentials->fileName()};
-    if (server.smbVersion != "default")
-      arguments << "-m" << server.smbVersion;
+    const QString maxProto = smbClientProtocol(server.smbVersion);
+    if (!maxProto.isEmpty())
+      arguments << "-m" << maxProto;
   }
+  auto done = std::make_shared<bool>(false);
+  connect(process, &QProcess::errorOccurred, this,
+          [this, process, done, program](QProcess::ProcessError error) {
+            if (*done || error != QProcess::FailedToStart)
+              return;
+            *done = true;
+            PlainMessageBox::warning(
+                this, "Discovery failed",
+                QString("Could not start %1 (%2).\nMake sure the required "
+                        "protocol tools are installed. You can still add "
+                        "shares manually.")
+                    .arg(program, process->errorString()));
+            process->deleteLater();
+          });
+  QTimer::singleShot(15000, this, [this, process, done] {
+    if (*done)
+      return;
+    *done = true;
+    process->kill();
+    PlainMessageBox::warning(
+        this, "Discovery failed",
+        "Discovery timed out.\nYou can still add shares manually.");
+    process->deleteLater();
+  });
   connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
-          this, [this, process, server](int code, QProcess::ExitStatus) {
+          this, [this, process, server, done](int code, QProcess::ExitStatus) {
+            if (*done)
+              return;
+            *done = true;
             if (code != 0) {
               PlainMessageBox::warning(
                   this, "Discovery failed",
@@ -650,10 +807,18 @@ void SettingsDialog::runDiscovery(const Server &server,
             if (dialog.exec() == QDialog::Accepted)
               for (int i = 0; i < list->count(); ++i)
                 if (list->item(i)->checkState() == Qt::Checked) {
-                  auto remote = list->item(i)->text(),
-                       name = server.protocol == Protocol::Nfs
-                                  ? QFileInfo(remote).fileName()
-                                  : remote;
+                  const QString remote =
+                      server.protocol == Protocol::Nfs
+                          ? QDir::cleanPath(list->item(i)->text())
+                          : list->item(i)->text().trimmed();
+                  const QString leaf =
+                      server.protocol == Protocol::Nfs
+                          ? safeMountLeaf(QFileInfo(remote).fileName(),
+                                          server.name.isEmpty() ? "root"
+                                                                : server.name)
+                          : safeMountLeaf(remote, server.name);
+                  const QString localPath =
+                      QDir::cleanPath(m_root->text().trimmed() + "/" + leaf);
                   bool exists =
                       std::any_of(m_config.shares.begin(),
                                   m_config.shares.end(), [&](const Share &s) {
@@ -663,13 +828,11 @@ void SettingsDialog::runDiscovery(const Server &server,
                   if (!exists)
                     m_config.shares.append(
                         {QUuid::createUuid().toString(QUuid::WithoutBraces),
-                         server.id, name, remote, m_root->text() + "/" + name,
-                         "", AutomountMode::Disabled, true});
+                         server.id, leaf, remote, localPath, "",
+                         AutomountMode::Disabled, true});
                 }
             rebuildShares();
             process->deleteLater();
           });
-  process->start(server.protocol == Protocol::Nfs ? "/usr/bin/showmount"
-                                                  : "/usr/bin/smbclient",
-                 arguments);
+  process->start(program, arguments);
 }

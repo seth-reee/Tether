@@ -13,4 +13,5 @@ private:
   QApplication *m_app;
   QFileSystemWatcher m_watcher;
   QString m_path;
+  void armWatcher();
 };

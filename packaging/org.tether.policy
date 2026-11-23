@@ -7,7 +7,6 @@
     <message>Authentication is required to apply network share configuration</message>
     <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/tether/tether-apply-helper</annotate>
-    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
   <action id="org.tether.control">
     <description>Connect or disconnect configured network shares</description>

@@ -16,6 +16,7 @@
 #include <QSet>
 #include <QStringList>
 #include <netdb.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <stdexcept>
@@ -33,78 +34,10 @@ const QString stateDir = "/etc/tether";
 const QString manifestPath = stateDir + "/managed.json";
 #endif
 
-struct Generated {
-  QString source, type;
-  QString shareId, mountUnit, automountUnit, localPath, enableUnit;
-  QHash<QString, QByteArray> files;
-};
-
 [[noreturn]] void fail(const QString &message) {
   throw std::runtime_error(message.toStdString());
 }
-bool validId(const QString &v) {
-  return !v.isEmpty() && v.size() <= 128 &&
-         !v.contains(QRegularExpression("[^A-Za-z0-9_.-]"));
-}
-bool validHost(const QString &v) {
-  return !v.isEmpty() && v.size() <= 253 &&
-         !v.contains(QRegularExpression("[^A-Za-z0-9.:-]"));
-}
-bool validPath(const QString &v) {
-  return v.startsWith('/') && !v.contains(QChar('\0')) && !v.contains('\n') &&
-         !v.contains('\r') && !v.split('/').contains("..");
-}
-bool validOptions(const QString &v) {
-  return v.size() <= 1024 && !v.contains(QRegularExpression("[\\s\\x00]")) &&
-         !v.toLower().contains("password=") &&
-         !(v.contains(",,") || v.startsWith(',') || v.endsWith(','));
-}
 
-QString chosenAddress(const Server &server) {
-#ifdef TETHER_HELPER_TEST
-  return server.hostname;
-#else
-  QByteArray hostname = server.hostname.toUtf8();
-  addrinfo hints{};
-  hints.ai_family = AF_INET;
-  addrinfo *result = nullptr;
-  if (getaddrinfo(hostname.constData(), nullptr, &hints, &result) == 0) {
-    freeaddrinfo(result);
-    return server.hostname;
-  }
-  if (!server.fallbackIp.isEmpty() && validHost(server.fallbackIp))
-    return server.fallbackIp;
-  fail("Hostname did not resolve and no fallback IP is configured");
-#endif
-}
-
-QString escapePath(const QString &value) {
-  if (!validPath(value))
-    fail("Invalid local mount path");
-  QByteArray raw = QDir::cleanPath(value).mid(1).toUtf8(), out;
-  if (raw.isEmpty())
-    return "-";
-  for (uchar b : raw) {
-    if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
-        (b >= '0' && b <= '9') || b == '_' || b == '.')
-      out += char(b);
-    else if (b == '/')
-      out += '-';
-    else
-      out += QString("\\x%1").arg(b, 2, 16, QChar('0')).toLatin1();
-  }
-  return QString::fromLatin1(out);
-}
-
-void writeFile(const QString &path, const QByteArray &data,
-               QFileDevice::Permissions permissions) {
-  QSaveFile file(path);
-  if (!file.open(QIODevice::WriteOnly) || !file.setPermissions(permissions) ||
-      file.write(data) != data.size() || !file.commit())
-    fail("Could not write " + path);
-  if (!QFile::setPermissions(path, permissions))
-    fail("Could not secure " + path);
-}
 void systemctl(const QStringList &arguments, bool tolerateFailure = false) {
 #ifdef TETHER_HELPER_TEST
   const auto command = arguments.join(' ');
@@ -120,76 +53,14 @@ void systemctl(const QStringList &arguments, bool tolerateFailure = false) {
 #endif
 }
 
-Generated generate(const Server &server, const Share &share) {
-  if (!validId(server.id) || !validId(share.id) ||
-      !validHost(server.hostname) || !validPath(share.localPath) ||
-      !validOptions(server.mountOptions) || !validOptions(share.mountOptions) ||
-      share.name.contains(QRegularExpression("[\\n\\r\\x00]")))
-    fail("Invalid configuration for share " + share.name);
-  if (!server.fallbackIp.isEmpty() && !validHost(server.fallbackIp))
-    fail("Invalid fallback address");
-  QString what, type,
-      options = share.mountOptions.isEmpty() ? server.mountOptions
-                                             : share.mountOptions;
-  const QString address = chosenAddress(server);
-  if (server.protocol == Protocol::Nfs) {
-    if (!validPath(share.remotePath))
-      fail("Invalid NFS export path");
-    what = address + ":" + share.remotePath;
-    type = "nfs";
-    if (options.isEmpty())
-      options = "nfsvers=" + server.nfsVersion;
-  } else {
-    if (share.remotePath.isEmpty() ||
-        share.remotePath.contains(QRegularExpression("[\\\\/\\n\\r\\x00]")) ||
-        server.smbUsername.isEmpty())
-      fail("Invalid SMB configuration");
-    what = "//" + address + "/" + share.remotePath;
-    type = "cifs";
-    QStringList values{"credentials=" + stateDir + "/credentials/" + server.id +
-                       ".cred"};
-    if (server.smbVersion != "default")
-      values << "vers=" + QString(server.smbVersion).remove("SMB");
-    if (!options.isEmpty())
-      values << options;
-    options = values.join(',');
-  }
-  Generated result;
-  result.source = what;
-  result.type = type;
-  result.shareId = share.id;
-  result.localPath = share.localPath;
-  auto escaped = escapePath(share.localPath);
-  result.mountUnit = escaped + ".mount";
-  result.files[result.mountUnit] =
-      QString("[Unit]\nDescription=Tether %1 share "
-              "%2\nWants=network-online.target\nAfter=network-online."
-              "target\n\n[Mount]\nWhat=%3\nWhere=%4\nType=%5\nOptions=%6\n\n["
-              "Install]\nWantedBy=multi-user.target\n")
-          .arg(protocolName(server.protocol).toUpper(), share.name, what,
-               share.localPath, type, options)
-          .toUtf8();
-  if (share.automount == AutomountMode::Access) {
-    result.automountUnit = escaped + ".automount";
-    result.enableUnit = result.automountUnit;
-    result.files[result.automountUnit] =
-        QString(
-            "[Unit]\nDescription=Automount Tether share "
-            "%1\nWants=network-online.target\nAfter=network-online.target\n\n["
-            "Automount]\nWhere=%2\n\n[Install]\nWantedBy=multi-user.target\n")
-            .arg(share.name, share.localPath)
-            .toUtf8();
-  } else if (share.automount == AutomountMode::Boot)
-    result.enableUnit = result.mountUnit;
-  return result;
-}
-
+#ifndef TETHER_HELPER_TEST
 QByteArray stdinData() {
   QFile input;
   if (!input.open(stdin, QIODevice::ReadOnly))
     fail("Could not read request");
   return input.readAll();
 }
+#endif
 QJsonObject parseInput() {
 #ifdef TETHER_HELPER_TEST
   return testRequest;
@@ -210,6 +81,191 @@ QJsonArray loadManaged() {
       .object()
       .value("shares")
       .toArray();
+}
+
+QByteArray currentMountInfo() {
+#ifdef TETHER_HELPER_TEST
+  return testMountinfo;
+#else
+  QFile mounts("/proc/self/mountinfo");
+  if (!mounts.open(QIODevice::ReadOnly))
+    fail("Could not read mount state");
+  return mounts.readAll();
+#endif
+}
+
+void verifyMount(const QJsonObject &record) {
+  if (!mountIdentityMatches(currentMountInfo(),
+                            QDir::cleanPath(record["local_path"].toString()),
+                            record["source"].toString(),
+                            record["type"].toString(),
+                            !record["automount_unit"].toString().isEmpty()))
+    fail("Mount identity could not be verified; refusing to change this share. "
+         "Reapply legacy configurations first.");
+}
+
+#if defined(TETHER_APPLY_HELPER) || defined(TETHER_HELPER_TEST)
+struct Generated {
+  QString source, type;
+  QString shareId, mountUnit, automountUnit, localPath, enableUnit;
+  QHash<QString, QByteArray> files;
+};
+
+bool validId(const QString &v) {
+  return !v.isEmpty() && v.size() <= 128 &&
+         !v.contains(QRegularExpression("[^A-Za-z0-9_.-]"));
+}
+bool validHost(const QString &v) {
+  return !v.isEmpty() && v.size() <= 253 &&
+         !v.contains(QRegularExpression("[^A-Za-z0-9.:-]"));
+}
+bool validPath(const QString &v) {
+  return v.startsWith('/') && !v.contains(QChar('\0')) && !v.contains('\n') &&
+         !v.contains('\r') && !v.split('/').contains("..");
+}
+bool validOptions(const QString &v) { return isValidMountOptions(v); }
+
+bool isForbiddenMountTarget(const QString &cleanPath) {
+  static const QSet<QString> exact{
+      "/",    "/bin",  "/boot", "/dev",  "/etc",  "/home",
+      "/lib", "/lib64", "/opt", "/proc", "/root", "/run",
+      "/sbin", "/srv", "/sys",  "/tmp",  "/usr",  "/var"};
+  if (exact.contains(cleanPath))
+    return true;
+  static const QStringList prefixes{"/bin/",  "/boot/", "/dev/", "/etc/",
+                                    "/lib/",  "/lib64/", "/proc/", "/run/",
+                                    "/sbin/", "/sys/",  "/usr/"};
+  for (const auto &prefix : prefixes)
+    if (cleanPath.startsWith(prefix))
+      return true;
+  return false;
+}
+
+QString chosenAddress(const Server &server) {
+#ifdef TETHER_HELPER_TEST
+  return server.hostname;
+#else
+  QByteArray hostname = server.hostname.toUtf8();
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  addrinfo *result = nullptr;
+  if (getaddrinfo(hostname.constData(), nullptr, &hints, &result) == 0) {
+    freeaddrinfo(result);
+    return server.hostname;
+  }
+  if (!server.fallbackIp.isEmpty() && validHost(server.fallbackIp))
+    return server.fallbackIp;
+  fail("Hostname did not resolve and no fallback IP is configured");
+#endif
+}
+
+QString escapePath(const QString &value) {
+  if (!validPath(value))
+    fail("Invalid local mount path");
+  return escapeSystemdPath(value);
+}
+
+void writeFile(const QString &path, const QByteArray &data,
+               QFileDevice::Permissions permissions) {
+  QSaveFile file(path);
+  if (!file.open(QIODevice::WriteOnly) || !file.setPermissions(permissions) ||
+      file.write(data) != data.size() || !file.commit())
+    fail("Could not write " + path);
+  if (!QFile::setPermissions(path, permissions))
+    fail("Could not secure " + path);
+}
+
+void mkpathPreservingOwner(const QString &cleanPath) {
+  QStringList missing;
+  QString cur = cleanPath;
+  while (cur != "/" && !QFileInfo::exists(cur)) {
+    if (QFileInfo(cur).isSymLink())
+      fail("Mount destinations must not traverse symlinks");
+    missing.append(cur);
+    const QString parent = QFileInfo(cur).absolutePath();
+    if (parent == cur)
+      break;
+    cur = parent;
+  }
+  struct stat st{};
+  const bool hasOwner = (::stat(cur.toUtf8().constData(), &st) == 0);
+  for (int i = missing.size() - 1; i >= 0; --i) {
+    const QString &dir = missing[i];
+    if (!QDir().mkdir(dir))
+      fail("Could not create mount directory " + dir);
+    if (hasOwner && st.st_uid != 0)
+      (void)::chown(dir.toUtf8().constData(), st.st_uid, st.st_gid);
+  }
+}
+
+Generated generate(const Server &server, const Share &share) {
+  if (!validId(server.id) || !validId(share.id) ||
+      !validHost(server.hostname) || !validPath(share.localPath) ||
+      !validOptions(server.mountOptions) || !validOptions(share.mountOptions) ||
+      share.name.contains(QRegularExpression("[\\n\\r\\x00]")))
+    fail("Invalid configuration for share " + share.name);
+  if (!server.fallbackIp.isEmpty() && !validHost(server.fallbackIp))
+    fail("Invalid fallback address");
+  const QString localPath = QDir::cleanPath(share.localPath);
+  QString what, type,
+      options = share.mountOptions.isEmpty() ? server.mountOptions
+                                             : share.mountOptions;
+  const QString address = chosenAddress(server);
+  if (server.protocol == Protocol::Nfs) {
+    if (!validPath(share.remotePath))
+      fail("Invalid NFS export path");
+    what = formatNfsSource(address, QDir::cleanPath(share.remotePath));
+    type = "nfs";
+    if (options.isEmpty())
+      options = "nfsvers=" + server.nfsVersion;
+  } else {
+    if (share.remotePath.isEmpty() ||
+        share.remotePath.contains(QRegularExpression("[\\\\/\\n\\r\\x00]")) ||
+        server.smbUsername.isEmpty())
+      fail("Invalid SMB configuration");
+    what = "//" + address + "/" + share.remotePath;
+    type = "cifs";
+    QStringList values{"credentials=" + stateDir + "/credentials/" + server.id +
+                       ".cred"};
+    const QString vers = smbMountVersion(server.smbVersion);
+    if (!vers.isEmpty())
+      values << "vers=" + vers;
+    if (!options.isEmpty())
+      values << options;
+    options = values.join(',');
+  }
+  Generated result;
+  result.source = what;
+  result.type = type;
+  result.shareId = share.id;
+  result.localPath = localPath;
+  auto escaped = escapePath(localPath);
+  result.mountUnit = escaped + ".mount";
+  result.files[result.mountUnit] =
+      QString("[Unit]\nDescription=Tether %1 share "
+              "%2\nWants=network-online.target\nAfter=network-online."
+              "target\n\n[Mount]\nWhat=%3\nWhere=%4\nType=%5\nOptions=%6\n\n["
+              "Install]\nWantedBy=multi-user.target\n")
+          .arg(protocolName(server.protocol).toUpper(),
+               escapeSystemdSpecifier(share.name),
+               escapeSystemdSpecifier(what),
+               escapeSystemdSpecifier(localPath), type,
+               escapeSystemdSpecifier(options))
+          .toUtf8();
+  if (share.automount == AutomountMode::Access) {
+    result.automountUnit = escaped + ".automount";
+    result.enableUnit = result.automountUnit;
+    result.files[result.automountUnit] =
+        QString(
+            "[Unit]\nDescription=Automount Tether share "
+            "%1\nWants=network-online.target\nAfter=network-online.target\n\n["
+            "Automount]\nWhere=%2\n\n[Install]\nWantedBy=multi-user.target\n")
+            .arg(escapeSystemdSpecifier(share.name),
+                 escapeSystemdSpecifier(localPath))
+            .toUtf8();
+  } else if (share.automount == AutomountMode::Boot)
+    result.enableUnit = result.mountUnit;
+  return result;
 }
 
 bool isLegacyOmamounterUnit(const QString &name, const QString &localPath) {
@@ -262,27 +318,6 @@ bool isLegacyOmamounterUnit(const QString &name, const QString &localPath) {
          !install.value("WantedBy").isEmpty();
 }
 
-QByteArray currentMountInfo() {
-#ifdef TETHER_HELPER_TEST
-  return testMountinfo;
-#else
-  QFile mounts("/proc/self/mountinfo");
-  if (!mounts.open(QIODevice::ReadOnly))
-    fail("Could not read mount state");
-  return mounts.readAll();
-#endif
-}
-
-void verifyMount(const QJsonObject &record) {
-  if (!mountIdentityMatches(currentMountInfo(),
-                            record["local_path"].toString(),
-                            record["source"].toString(),
-                            record["type"].toString(),
-                            !record["automount_unit"].toString().isEmpty()))
-    fail("Mount identity could not be verified; refusing to change this share. "
-         "Reapply legacy configurations first.");
-}
-
 void apply() {
   auto request = parseInput(),
        configObject = request.value("config").toObject(),
@@ -292,11 +327,9 @@ void apply() {
   for (const auto &s : config.servers) {
     if (!validId(s.id) || !validHost(s.hostname))
       fail("Invalid server identity");
-    if (!QStringList{"3", "4", "4.0", "4.1", "4.2"}.contains(s.nfsVersion))
+    if (!allowedNfsVersions().contains(s.nfsVersion))
       fail("Unsupported NFS version");
-    if (!QStringList{"default", "2.0", "2.1", "3", "3.0", "3.02", "3.1.1",
-                     "SMB2", "SMB3"}
-             .contains(s.smbVersion))
+    if (!allowedSmbVersions().contains(s.smbVersion))
       fail("Unsupported SMB version");
     if (s.protocol == Protocol::Smb && serverHasEnabledShares(config, s.id)) {
       auto c = credentials.value(s.id).toObject();
@@ -331,27 +364,29 @@ void apply() {
       newUnits.insert(it.key());
     }
   const auto oldManifest = loadManaged();
+  QHash<QString, QJsonObject> oldByPath;
+  for (const auto &v : oldManifest) {
+    const auto o = v.toObject();
+    oldByPath.insert(QDir::cleanPath(o["local_path"].toString()), o);
+  }
   // Check every target before any unit removal, directory creation, or write.
   for (const auto &g : generated) {
-    QString path = QDir::cleanPath(g.localPath);
-    if (path == "/" || path == "/etc" || path == "/usr" || path == "/var" ||
-        path == "/home")
+    QString path = g.localPath;
+    if (isForbiddenMountTarget(path))
       fail("Refusing a system directory as a mount destination");
     while (path != "/") {
       if (QFileInfo(path).isSymLink())
         fail("Mount destinations must not traverse symlinks");
       path = QFileInfo(path).absolutePath();
     }
-    bool ownedAutomount = false;
-    for (const auto &old : oldManifest)
-      if (old.toObject()["local_path"].toString() == g.localPath &&
-          !old.toObject()["automount_unit"].toString().isEmpty())
-        ownedAutomount = true;
-    verifyMount(
-        QJsonObject{{"local_path", g.localPath},
-                    {"source", g.source},
-                    {"type", g.type},
-                    {"automount_unit", ownedAutomount ? "managed" : ""}});
+    if (oldByPath.contains(g.localPath)) {
+      verifyMount(oldByPath.value(g.localPath));
+    } else {
+      verifyMount(QJsonObject{{"local_path", g.localPath},
+                              {"source", g.source},
+                              {"type", g.type},
+                              {"automount_unit", ""}});
+    }
   }
   QSet<QString> ownedUnits;
   for (const auto &v : oldManifest) {
@@ -376,6 +411,17 @@ void apply() {
            ". Choose a different local path for this share in Tether's Shares "
            "tab, or retire the existing unit before applying again.");
   }
+  const QString credDirPath = stateDir + "/credentials";
+  QSet<QString> existingCredFiles;
+  for (const auto &name :
+       QDir(credDirPath).entryList({"*.cred"}, QDir::Files))
+    existingCredFiles.insert(credDirPath + "/" + name);
+  QSet<QString> activeCredFiles;
+  for (const auto &server : config.servers)
+    if (server.protocol == Protocol::Smb &&
+        serverHasEnabledShares(config, server.id))
+      activeCredFiles.insert(credDirPath + "/" + server.id + ".cred");
+
   FileTransaction transaction;
   transaction.capture(manifestPath);
   for (const auto &name : ownedUnits)
@@ -383,9 +429,10 @@ void apply() {
       transaction.capture(systemdDir + "/" + name);
   for (const auto &name : newUnits)
     transaction.capture(systemdDir + "/" + name);
-  for (const auto &server : config.servers)
-    if (server.protocol == Protocol::Smb && serverHasEnabledShares(config, server.id))
-      transaction.capture(stateDir + "/credentials/" + server.id + ".cred");
+  for (const auto &path : existingCredFiles)
+    transaction.capture(path);
+  for (const auto &path : activeCredFiles)
+    transaction.capture(path);
   try {
     for (const auto &v : oldManifest) {
       auto o = v.toObject();
@@ -400,16 +447,41 @@ void apply() {
             fail("Could not remove retired unit");
         }
     }
+    for (const auto &g : generated) {
+      if (!oldByPath.contains(g.localPath))
+        continue;
+      const auto old = oldByPath.value(g.localPath);
+      QByteArray oldBytes;
+      QFile existingUnit(systemdDir + "/" + g.mountUnit);
+      if (existingUnit.open(QIODevice::ReadOnly))
+        oldBytes = existingUnit.readAll();
+      const bool unitChanged = old["source"].toString() != g.source ||
+                               old["type"].toString() != g.type ||
+                               oldBytes != g.files.value(g.mountUnit);
+      const bool switchingToAccess =
+          !g.automountUnit.isEmpty() &&
+          old["automount_unit"].toString().isEmpty();
+      if ((unitChanged || switchingToAccess) &&
+          mountStatus(currentMountInfo(), g.localPath,
+                      {old["source"].toString()},
+                      old["type"].toString()) != "Unmounted") {
+        verifyMount(old);
+        const QString oldAuto = old["automount_unit"].toString();
+        if (!oldAuto.isEmpty() && newUnits.contains(oldAuto))
+          systemctl({"stop", oldAuto});
+        systemctl({"stop", old["mount_unit"].toString()});
+      }
+    }
     QDir().mkpath(systemdDir);
-    QDir().mkpath(stateDir + "/credentials");
+    QDir().mkpath(credDirPath);
     QFile::setPermissions(stateDir, QFileDevice::ReadOwner |
                                         QFileDevice::WriteOwner |
                                         QFileDevice::ExeOwner);
-    QFile::setPermissions(stateDir + "/credentials",
-                          QFileDevice::ReadOwner | QFileDevice::WriteOwner |
-                              QFileDevice::ExeOwner);
+    QFile::setPermissions(credDirPath, QFileDevice::ReadOwner |
+                                           QFileDevice::WriteOwner |
+                                           QFileDevice::ExeOwner);
     for (const auto &g : generated) {
-      QDir().mkpath(g.localPath);
+      mkpathPreservingOwner(g.localPath);
       for (auto it = g.files.begin(); it != g.files.end(); ++it)
         writeFile(systemdDir + "/" + it.key(), it.value(),
                   QFileDevice::ReadOwner | QFileDevice::WriteOwner |
@@ -429,9 +501,13 @@ void apply() {
                              "\npassword=" + password.toUtf8() + "\n";
         if (!domain.isEmpty())
           content += "domain=" + domain.toUtf8() + "\n";
-        writeFile(stateDir + "/credentials/" + s.id + ".cred", content,
+        writeFile(credDirPath + "/" + s.id + ".cred", content,
                   QFileDevice::ReadOwner | QFileDevice::WriteOwner);
       }
+    for (const auto &staleCred : existingCredFiles)
+      if (!activeCredFiles.contains(staleCred) && QFile::exists(staleCred) &&
+          !QFile::remove(staleCred))
+        fail("Could not remove unused credentials file");
     QJsonArray manifest;
     for (const auto &g : generated)
       manifest.append(QJsonObject{{"share_id", g.shareId},
@@ -474,7 +550,9 @@ void apply() {
          "checking the server.\n" +
          failures.join('\n'));
 }
+#endif
 
+#if defined(TETHER_CONTROL_HELPER) || defined(TETHER_HELPER_TEST)
 void control() {
   auto request = parseInput();
   auto action = request["action"].toString();
@@ -488,19 +566,27 @@ void control() {
   auto ids = request["share_ids"].toArray();
   if (ids.isEmpty())
     fail("No shares requested");
+  QStringList failures;
   for (const auto &v : ids) {
-    auto id = v.toString();
-    if (!managed.contains(id))
-      fail("Share is not in the root-owned manifest");
-    verifyMount(managed[id]);
-    if (action == "unmount" &&
-        !managed[id]["automount_unit"].toString().isEmpty())
-      systemctl({"stop", managed[id]["automount_unit"].toString()});
-    verifyMount(managed[id]);
-    systemctl({action == "mount" ? "start" : "stop",
-               managed[id]["mount_unit"].toString()});
+    const auto id = v.toString();
+    try {
+      if (!managed.contains(id))
+        fail("Share is not in the root-owned manifest");
+      verifyMount(managed[id]);
+      if (action == "unmount" &&
+          !managed[id]["automount_unit"].toString().isEmpty())
+        systemctl({"stop", managed[id]["automount_unit"].toString()});
+      verifyMount(managed[id]);
+      systemctl({action == "mount" ? "start" : "stop",
+                 managed[id]["mount_unit"].toString()});
+    } catch (const std::exception &error) {
+      failures << (id + ": " + QString::fromUtf8(error.what()));
+    }
   }
+  if (!failures.isEmpty())
+    fail(failures.join('\n'));
 }
+#endif
 } // namespace
 
 #ifndef TETHER_HELPER_TEST

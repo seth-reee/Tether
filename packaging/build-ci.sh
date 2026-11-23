@@ -34,7 +34,10 @@ set -e
 cat smoke.log
 [[ "$smoke_status" == 124 ]] || { echo "Startup smoke test failed: $smoke_status" >&2; exit 1; }
 for helper in tether-apply-helper tether-control-helper; do
-  readelf -h "unpacked/usr/lib/tether/$helper" | grep -E 'Machine:.*(X86-64|AArch64)'
+  case "$expected_arch" in
+    x86_64) readelf -h "unpacked/usr/lib/tether/$helper" | grep -F 'Advanced Micro Devices X86-64' ;;
+    aarch64) readelf -h "unpacked/usr/lib/tether/$helper" | grep -F 'AArch64' ;;
+  esac
 done
 test -s unpacked/usr/share/polkit-1/actions/org.tether.policy
 cd /out

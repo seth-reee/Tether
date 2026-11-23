@@ -38,9 +38,7 @@ apply a share at the same destination as an old OmaMounter share, Tether can
 replace the legacy mount unit if that destination is unmounted. Mount units
 from other applications are left untouched.
 
-For manual installation, extract the binary tarball and follow its
-`INSTALL.txt`. It includes the application and required authorization helpers;
-Qt and protocol tools are system dependencies.
+For manual installation from a local source build (`cmake --install build --prefix /tmp/tether-stage`), see [packaging/INSTALL.txt](packaging/INSTALL.txt) for the installed file layout and runtime dependencies.
 
 After installation, launch **Tether** from the application menu or run:
 

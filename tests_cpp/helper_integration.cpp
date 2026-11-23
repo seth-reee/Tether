@@ -162,6 +162,117 @@ private slots:
     QVERIFY(loadManaged().isEmpty());
     QVERIFY(!QFile::exists(stateDir + "/credentials/" + config.servers[0].id + ".cred"));
   }
+  void uncleanedLocalPathStillVerifiesMount() {
+    const QString clean = config.shares[0].localPath;
+    config.shares[0].localPath = clean + "/";
+    testMountinfo = ("31 24 0:30 / " + clean + " rw - ext4 /dev/fake rw\n").toUtf8();
+    QVERIFY_EXCEPTION_THROWN(requestApply(), std::runtime_error);
+    QVERIFY(loadManaged().isEmpty());
+
+    testMountinfo.clear();
+    requestApply();
+    QCOMPARE(loadManaged()[0].toObject()["local_path"].toString(), clean);
+    QVERIFY(read(systemdDir + "/" + unit()).contains(("Where=" + clean + "\n").toUtf8()));
+  }
+  void staleCredentialsRemovedAndRolledBack() {
+    config.servers[0].protocol = Protocol::Smb;
+    config.servers[0].smbUsername = "tester";
+    config.shares[0].remotePath = "Media";
+    testRequest = {{"config", toJson(config)},
+                   {"credentials",
+                    QJsonObject{{config.servers[0].id,
+                                 QJsonObject{{"username", "tester"},
+                                             {"password", "secret-1"}}}}}};
+    apply();
+    const auto credPath =
+        stateDir + "/credentials/" + config.servers[0].id + ".cred";
+    QVERIFY(QFile::exists(credPath));
+
+    // Rollback restores deleted credential file when daemon-reload fails.
+    config.shares[0].enabled = false;
+    testFailure = "daemon-reload";
+    QVERIFY_EXCEPTION_THROWN(requestApply(), std::runtime_error);
+    QVERIFY(QFile::exists(credPath));
+    QVERIFY(read(credPath).contains("secret-1"));
+
+    // Successful apply deletes unused credential file.
+    requestApply();
+    QVERIFY(!QFile::exists(credPath));
+  }
+  void rejectsForbiddenMountOptionsAndPaths() {
+    for (const char *badOpt :
+         {"pass=secret", "credentials=/etc/shadow", "cred=/etc/shadow",
+          "uid=1000,PASS=secret"}) {
+      config.servers[0].mountOptions = badOpt;
+      QVERIFY_EXCEPTION_THROWN(requestApply(), std::runtime_error);
+    }
+    config.servers[0].mountOptions.clear();
+    for (const char *badPath : {"/boot", "/etc/systemd/test", "/proc/test"}) {
+      config.shares[0].localPath = badPath;
+      QVERIFY_EXCEPTION_THROWN(requestApply(), std::runtime_error);
+    }
+  }
+  void escapesSystemdSpecifiersAndIpv6AndSmbVersion() {
+    config.servers[0].hostname = "fd00::1";
+    config.shares[0].name = "100% Media";
+    config.shares[0].localPath = temp->path() + "/100%mount";
+    requestApply();
+    const auto unitBytes = read(systemdDir + "/" + unit());
+    QVERIFY(unitBytes.contains("What=[fd00::1]:/exports/media\n"));
+    QVERIFY(unitBytes.contains("Description=Tether NFS share 100%% Media\n"));
+    QVERIFY(unitBytes.contains(("Where=" + temp->path() + "/100%%mount\n").toUtf8()));
+    QCOMPARE(loadManaged()[0].toObject()["local_path"].toString(),
+             temp->path() + "/100%mount");
+
+    config.servers[0].protocol = Protocol::Smb;
+    config.servers[0].hostname = "nas.example";
+    config.servers[0].smbUsername = "tester";
+    config.servers[0].smbVersion = "SMB2";
+    config.shares[0].remotePath = "Media";
+    testRequest = {{"config", toJson(config)},
+                   {"credentials",
+                    QJsonObject{{config.servers[0].id,
+                                 QJsonObject{{"username", "tester"},
+                                             {"password", "secret"}}}}}};
+    apply();
+    const auto smbUnit = read(systemdDir + "/" + unit());
+    QVERIFY(smbUnit.contains("vers=2.1"));
+    QVERIFY(!smbUnit.contains("vers=2,"));
+  }
+  void editMountedShareStopsAndReplacesUnit() {
+    requestApply();
+    testMountinfo = ("31 24 0:30 / " + config.shares[0].localPath +
+                     " rw - nfs4 nas.example:/exports/media rw\n")
+                        .toUtf8();
+    config.shares[0].remotePath = "/exports/updated";
+    testCommands.clear();
+    requestApply();
+    QVERIFY(testCommands.contains("stop " + unit()));
+    QVERIFY(read(systemdDir + "/" + unit())
+                .contains("What=nas.example:/exports/updated\n"));
+    QCOMPARE(loadManaged()[0].toObject()["source"].toString(),
+             QString("nas.example:/exports/updated"));
+  }
+  void batchControlContinuesAfterFailure() {
+    Share second = config.shares[0];
+    second.id = "second-share";
+    second.name = "Docs";
+    second.remotePath = "/exports/docs";
+    second.localPath = temp->path() + "/docs";
+    config.shares.append(second);
+    requestApply();
+
+    const QString unit1 = escapePath(config.shares[0].localPath) + ".mount";
+    const QString unit2 = escapePath(config.shares[1].localPath) + ".mount";
+    testCommands.clear();
+    testFailure = "start " + unit1;
+    testRequest = {
+        {"action", "mount"},
+        {"share_ids", QJsonArray{config.shares[0].id, config.shares[1].id}}};
+    QVERIFY_EXCEPTION_THROWN(control(), std::runtime_error);
+    QVERIFY(testCommands.contains("start " + unit1));
+    QVERIFY(testCommands.contains("start " + unit2));
+  }
 };
 QTEST_GUILESS_MAIN(HelperIntegration)
 #include "helper_integration.moc"

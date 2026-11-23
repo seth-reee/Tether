@@ -32,14 +32,16 @@ private slots:
     config.servers.append(smb);
     SettingsDialog dialog(config);
     auto *protocol = dialog.findChild<QComboBox *>("serverProtocol");
-    auto *nfs = dialog.findChild<QLineEdit *>("nfsVersion");
+    auto *nfs = dialog.findChild<QComboBox *>("nfsVersion");
     auto *user = dialog.findChild<QLineEdit *>("smbUsername");
+    QVERIFY(nfs);
     auto *form = qobject_cast<QFormLayout *>(nfs->parentWidget()->layout());
     QVERIFY(form);
     QVERIFY(!nfs->isHidden());
     QVERIFY(!form->labelForField(nfs)->isHidden());
     for (auto name : {"smbUsername", "smbDomain", "smbVersion", "smbPassword"}) {
-      auto *field = dialog.findChild<QLineEdit *>(name);
+      auto *field = dialog.findChild<QWidget *>(name);
+      QVERIFY(field);
       QVERIFY(field->isHidden());
       QVERIFY(form->labelForField(field)->isHidden());
     }
@@ -56,6 +58,52 @@ private slots:
     QCOMPARE(user->text(), QString("tester"));
     dialog.findChild<QListWidget *>()->setCurrentRow(0);
     QCOMPARE(user->text(), QString("kept"));
+  }
+  void removeAndSwitchEmptyServer() {
+    SettingsDialog dialog(sampleConfig());
+    auto *list = dialog.findChild<QListWidget *>();
+    QCOMPARE(list->count(), 1);
+    QVERIFY(QMetaObject::invokeMethod(&dialog, "addServer", Qt::DirectConnection));
+    QCOMPARE(list->count(), 2);
+    QCOMPARE(list->currentRow(), 1);
+    // Switching away from an incomplete server should not trap the user.
+    list->setCurrentRow(0);
+    QCOMPARE(list->currentRow(), 0);
+    // Switching back and deleting the empty server must succeed without errors.
+    list->setCurrentRow(1);
+    QVERIFY(
+        QMetaObject::invokeMethod(&dialog, "removeServer", Qt::DirectConnection));
+    QCOMPARE(list->count(), 1);
+    QCOMPARE(dialog.config().servers.size(), 1);
+  }
+  void disabledSharesExcludedFromControlAll() {
+    auto config = sampleConfig();
+    Share disabled = config.shares[0];
+    disabled.id = "disabled-share";
+    disabled.name = "Archive";
+    disabled.localPath = "/mnt/test/Archive";
+    disabled.enabled = false;
+    config.shares.append(disabled);
+    MainWindow window(config, ConfigStore("/unused/test-config"));
+    auto *table = window.findChild<QTableWidget *>();
+    QCOMPARE(table->rowCount(), 2);
+    auto *disabledCheck = qobject_cast<QCheckBox *>(table->cellWidget(1, 0));
+    QVERIFY(disabledCheck);
+    QVERIFY(!disabledCheck->isEnabled());
+    QVERIFY(!disabledCheck->isChecked());
+    QCOMPARE(table->item(1, 6)->text(), QString("Disabled"));
+
+    QStringList allIds;
+    QVERIFY(QMetaObject::invokeMethod(&window, "collectControlIds",
+                                      Qt::DirectConnection,
+                                      Q_RETURN_ARG(QStringList, allIds),
+                                      Q_ARG(bool, true)));
+    QCOMPARE(allIds, QStringList{"test-share"});
+
+    // Polling refresh should preserve existing row widgets in place.
+    auto *firstCheckBefore = table->cellWidget(0, 0);
+    QVERIFY(QMetaObject::invokeMethod(&window, "refresh", Qt::DirectConnection));
+    QCOMPARE(table->cellWidget(0, 0), firstCheckBefore);
   }
   void plainSettingsButtons() {
     SettingsDialog dialog(defaultConfig());
@@ -228,11 +276,43 @@ private slots:
     MainWindow configured(sampleConfig(), ConfigStore(dir.filePath("config.json")));
     QVERIFY(configured.findChild<QWidget *>("welcome")->isHidden());
   }
-  void nfsCommand() {
+  void protocolHelpersAndValidation() {
+    QCOMPARE(smbMountVersion("default"), QString());
+    QCOMPARE(smbMountVersion("SMB2"), QString("2.1"));
+    QCOMPARE(smbMountVersion("SMB3"), QString("3"));
+    QCOMPARE(smbMountVersion("3.1.1"), QString("3.1.1"));
+    QCOMPARE(smbClientProtocol("default"), QString());
+    QCOMPARE(smbClientProtocol("2.0"), QString("SMB2_02"));
+    QCOMPARE(smbClientProtocol("3.0"), QString("SMB3_00"));
+    QCOMPARE(smbClientProtocol("3.1.1"), QString("SMB3_11"));
+    QCOMPARE(smbClientProtocol("SMB2"), QString("SMB2"));
+    QCOMPARE(formatNfsSource("nas.example", "/exports/media"),
+             QString("nas.example:/exports/media"));
+    QCOMPARE(formatNfsSource("fd00::1", "/exports/media"),
+             QString("[fd00::1]:/exports/media"));
+    QCOMPARE(validateMountOptions("bypass=1,uid=1000"),
+             QString("bypass=1,uid=1000"));
+    QVERIFY_EXCEPTION_THROWN(validateMountOptions("pass=secret"),
+                             std::invalid_argument);
+    QVERIFY_EXCEPTION_THROWN(validateMountOptions("credentials=/etc/shadow"),
+                             std::invalid_argument);
+    QVERIFY_EXCEPTION_THROWN(validateMountOptions("cred=/etc/shadow"),
+                             std::invalid_argument);
+  }
+  void previewMatchesHelperFormat() {
     auto c = sampleConfig();
-    QCOMPARE(nfsMountCommand(c.servers[0], c.shares[0], "nas.example"),
-             QStringList({"mount", "-t", "nfs", "nas.example:/exports/media",
-                          "/mnt/test/Media", "-o", "nfsvers=4"}));
+    c.servers[0].hostname = "fd00::1";
+    c.shares[0].localPath = "/mnt/100%media/";
+    const auto text = previewUnits(c);
+    QVERIFY(text.contains("What=[fd00::1]:/exports/media\n"));
+    QVERIFY(text.contains("Where=/mnt/100%%media\n"));
+
+    c.servers[0].protocol = Protocol::Smb;
+    c.servers[0].hostname = "nas.example";
+    c.servers[0].smbVersion = "SMB2";
+    c.shares[0].remotePath = "Media";
+    const auto smbText = previewUnits(c);
+    QVERIFY(smbText.contains("vers=2.1"));
   }
   void parsers() {
     QCOMPARE(parseNfsExports("Export list for host:\n/exports/media *\n"),
@@ -242,6 +322,7 @@ private slots:
   }
   void escaping() {
     QCOMPARE(systemdEscapePath("/mnt/TV-Shows"), QString("mnt-TV\\x2dShows"));
+    QCOMPARE(systemdEscapePath("/.hidden"), QString("\\x2ehidden"));
   }
   void configRoundTrip() {
     auto c = sampleConfig();

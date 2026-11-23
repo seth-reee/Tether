@@ -4,8 +4,13 @@
 inline AppConfig sampleConfig() {
   AppConfig c;
   c.mountRoot = "/mnt/test";
-  c.servers.append({"test-server", "Test server", "nas.example", "192.0.2.10",
-                    Protocol::Nfs});
+  Server server;
+  server.id = "test-server";
+  server.name = "Test server";
+  server.hostname = "nas.example";
+  server.fallbackIp = "192.0.2.10";
+  server.protocol = Protocol::Nfs;
+  c.servers.append(server);
   c.shares.append({"test-share", "test-server", "Media", "/exports/media",
                    "/mnt/test/Media", "", AutomountMode::Disabled, true});
   return c;

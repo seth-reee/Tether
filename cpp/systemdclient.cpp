@@ -4,21 +4,7 @@
 #include <QJsonDocument>
 
 QString systemdEscapePath(const QString &path) {
-  auto p = validateAbsolutePath(path).mid(1);
-  if (p.isEmpty())
-    return "-";
-  QByteArray out;
-  for (auto b : p.toUtf8()) {
-    uchar u = uchar(b);
-    if ((u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') ||
-        (u >= '0' && u <= '9') || u == '_' || u == '.')
-      out += char(u);
-    else if (u == '/')
-      out += '-';
-    else
-      out += QString("\\x%1").arg(u, 2, 16, QChar('0')).toLatin1();
-  }
-  return QString::fromLatin1(out);
+  return escapeSystemdPath(path);
 }
 QString previewUnits(const AppConfig &c) {
   QString text;
@@ -29,10 +15,12 @@ QString previewUnits(const AppConfig &c) {
                            [&](const Server &s) { return s.id == h.serverId; });
     if (it == c.servers.end())
       continue;
-    auto name = systemdEscapePath(h.localPath);
-    QString what = it->protocol == Protocol::Nfs
-                       ? it->hostname + ":" + h.remotePath
-                       : "//" + it->hostname + "/" + h.remotePath;
+    const QString localPath = validateAbsolutePath(h.localPath);
+    const QString name = systemdEscapePath(localPath);
+    const QString what =
+        it->protocol == Protocol::Nfs
+            ? formatNfsSource(it->hostname, validateAbsolutePath(h.remotePath))
+            : "//" + it->hostname + "/" + h.remotePath;
     QString options =
         h.mountOptions.isEmpty() ? it->mountOptions : h.mountOptions;
     if (it->protocol == Protocol::Nfs && options.isEmpty())
@@ -40,8 +28,9 @@ QString previewUnits(const AppConfig &c) {
     if (it->protocol == Protocol::Smb) {
       QStringList o{"credentials=/etc/tether/credentials/" + it->id +
                     ".cred"};
-      if (it->smbVersion != "default")
-        o << "vers=" + QString(it->smbVersion).remove("SMB");
+      const QString vers = smbMountVersion(it->smbVersion);
+      if (!vers.isEmpty())
+        o << "vers=" + vers;
       if (!options.isEmpty())
         o << options;
       options = o.join(',');
@@ -49,11 +38,13 @@ QString previewUnits(const AppConfig &c) {
     text +=
         QString(
             "### %1.mount\n[Mount]\nWhat=%2\nWhere=%3\nType=%4\nOptions=%5\n\n")
-            .arg(name, what, h.localPath,
-                 protocolName(it->protocol) == "nfs" ? "nfs" : "cifs", options);
+            .arg(name, escapeSystemdSpecifier(what),
+                 escapeSystemdSpecifier(localPath),
+                 protocolName(it->protocol) == "nfs" ? "nfs" : "cifs",
+                 escapeSystemdSpecifier(options));
     if (h.automount == AutomountMode::Access)
       text += QString("### %1.automount\n[Automount]\nWhere=%2\n\n")
-                  .arg(name, h.localPath);
+                  .arg(name, escapeSystemdSpecifier(localPath));
   }
   return text;
 }

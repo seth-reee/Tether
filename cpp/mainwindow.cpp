@@ -77,6 +77,7 @@ MainWindow::MainWindow(AppConfig c, ConfigStore s)
   connect(&m_helper, &HelperClient::finished, this,
           [this](const QString &) { refresh(); });
   connect(&m_helper, &HelperClient::failed, this, [this](const QString &e) {
+    refresh();
     PlainMessageBox::warning(this, "Operation failed", e);
   });
   refresh();
@@ -92,75 +93,127 @@ void MainWindow::refresh() {
           : "No shares configured. Open Settings to discover or add shares.");
   m_welcome->findChild<QPushButton *>()->setText(
       m_config.servers.isEmpty() ? "Add server" : "Add shares");
-  QHash<QString, bool> selected;
-  for (int r = 0; r < m_table->rowCount(); ++r) {
-    auto *check = qobject_cast<QCheckBox *>(m_table->cellWidget(r, 0));
-    if (check)
-      selected.insert(check->property("shareId").toString(),
-                      check->isChecked());
-  }
+
+  struct RowData {
+    QString key;
+    QString shareId;
+    bool enabled;
+    QStringList columns;
+    QString status;
+  };
   QFile mounts("/proc/self/mountinfo");
   const bool readable = mounts.open(QIODevice::ReadOnly);
   const auto mountinfo = readable ? mounts.readAll() : QByteArray();
-  m_table->setRowCount(0);
+
+  QVector<RowData> rows;
+  QStringList rowKeys;
   int mounted = 0;
   for (const auto &h : m_config.shares) {
     auto it = std::find_if(m_config.servers.begin(), m_config.servers.end(),
                            [&](const Server &s) { return s.id == h.serverId; });
     if (it == m_config.servers.end())
       continue;
-    int r = m_table->rowCount();
-    m_table->insertRow(r);
-    auto *c = new QCheckBox;
-    c->setChecked(selected.value(h.id, h.enabled));
-    c->setProperty("shareId", h.id);
-    m_table->setCellWidget(r, 0, c);
     QStringList sources;
     for (const auto &host : {it->hostname, it->fallbackIp}) {
       if (!host.isEmpty())
         sources << (it->protocol == Protocol::Nfs
-                        ? host + ":" + h.remotePath
+                        ? formatNfsSource(host, h.remotePath)
                         : "//" + host + "/" + h.remotePath);
     }
-    const auto status =
+    QString status =
         readable ? mountStatus(mountinfo, h.localPath, sources,
                                it->protocol == Protocol::Nfs ? "nfs" : "cifs")
                  : "Unknown";
-    QStringList v{
-        it->name,     h.name,      protocolName(it->protocol).toUpper(),
-        h.remotePath, h.localPath, status};
     if (status == "Mounted")
       mounted++;
-    for (int i = 0; i < v.size(); ++i)
-      m_table->setItem(r, i + 1, new QTableWidgetItem(v[i]));
+    if (!h.enabled)
+      status = (status == "Unmounted") ? "Disabled" : status + " (disabled)";
+    const QString proto = protocolName(it->protocol).toUpper();
+    const QString key = QStringList{h.id, it->name, h.name, proto, h.remotePath,
+                                    h.localPath, h.enabled ? "1" : "0"}
+                            .join('\x1f');
+    rowKeys << key;
+    rows.append({key,
+                 h.id,
+                 h.enabled,
+                 {it->name, h.name, proto, h.remotePath, h.localPath},
+                 status});
   }
+
+  if (rowKeys == m_rowKeys && m_table->rowCount() == rows.size()) {
+    for (int r = 0; r < rows.size(); ++r) {
+      if (auto *item = m_table->item(r, 6))
+        item->setText(rows[r].status);
+      else
+        m_table->setItem(r, 6, new QTableWidgetItem(rows[r].status));
+    }
+  } else {
+    QHash<QString, bool> selected;
+    for (int r = 0; r < m_table->rowCount(); ++r) {
+      auto *check = qobject_cast<QCheckBox *>(m_table->cellWidget(r, 0));
+      if (check && check->property("shareEnabled").toBool())
+        selected.insert(check->property("shareId").toString(),
+                        check->isChecked());
+    }
+    m_table->setRowCount(0);
+    for (const auto &row : rows) {
+      const int r = m_table->rowCount();
+      m_table->insertRow(r);
+      auto *c = new QCheckBox;
+      c->setProperty("shareId", row.shareId);
+      c->setProperty("shareEnabled", row.enabled);
+      c->setChecked(row.enabled ? selected.value(row.shareId, true) : false);
+      c->setEnabled(row.enabled);
+      m_table->setCellWidget(r, 0, c);
+      for (int i = 0; i < row.columns.size(); ++i)
+        m_table->setItem(r, i + 1, new QTableWidgetItem(row.columns[i]));
+      m_table->setItem(r, 6, new QTableWidgetItem(row.status));
+    }
+    m_rowKeys = rowKeys;
+  }
+
   m_summary->setText(QString("%1 configured shares · %2 mounted")
                          .arg(m_config.shares.size())
                          .arg(mounted));
 }
 void MainWindow::settings() {
-  SettingsDialog d(m_config, this);
+  SettingsDialog d(m_config, this, m_store);
   if (m_config.servers.isEmpty())
     d.beginAddServer();
   if (d.exec() == QDialog::Accepted) {
     m_config = d.config();
+    if (!d.savedToDisk()) {
+      try {
+        m_store.save(m_config);
+      } catch (const std::exception &e) {
+        PlainMessageBox::critical(this, "Save failed", e.what());
+      }
+    }
+    refresh();
+  } else if (d.savedToDisk()) {
     try {
-      m_store.save(m_config);
+      m_config = m_store.load();
     } catch (const std::exception &e) {
-      PlainMessageBox::critical(this, "Save failed", e.what());
+      PlainMessageBox::warning(this, "Reload failed", e.what());
     }
     refresh();
   }
 }
-void MainWindow::control(const QString &a, bool all) {
+QStringList MainWindow::collectControlIds(bool all) const {
   QStringList ids;
   for (int r = 0; r < m_table->rowCount(); ++r) {
     auto *c = qobject_cast<QCheckBox *>(m_table->cellWidget(r, 0));
-    if (c && (all || c->isChecked()))
+    if (c && c->property("shareEnabled").toBool() && (all || c->isChecked()))
       ids << c->property("shareId").toString();
   }
+  return ids;
+}
+void MainWindow::control(const QString &a, bool all) {
+  const auto ids = collectControlIds(all);
   if (ids.isEmpty()) {
-    PlainMessageBox::information(this, "No shares", "Select at least one share.");
+    PlainMessageBox::information(this, "No shares",
+                                 all ? "No enabled shares configured."
+                                     : "Select at least one enabled share.");
     return;
   }
   m_helper.control(a, ids);
